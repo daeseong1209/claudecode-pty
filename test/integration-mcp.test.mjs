@@ -107,7 +107,7 @@ async function withClient(fn) {
   }
 }
 
-test('lists 8 pty tools', async () => {
+test('lists 9 pty tools', async () => {
   await withClient(async (client) => {
     const result = await client.request('tools/list', {})
     const names = result.tools.map((t) => t.name).sort()
@@ -116,11 +116,65 @@ test('lists 8 pty tools', async () => {
       'pty_list',
       'pty_read',
       'pty_resize',
+      'pty_screenshot',
       'pty_send_key',
       'pty_spawn',
       'pty_wait',
       'pty_write',
     ])
+  })
+})
+
+test('pty_screenshot plain format returns rendered grid', async () => {
+  await withClient(async (client) => {
+    const spawnResult = await client.request('tools/call', {
+      name: 'pty_spawn',
+      arguments: {
+        command: 'bash',
+        args: ['-c', 'printf "line1\\nline2\\n\\x1b[31mred\\x1b[0m\\n"; sleep 2'],
+        description: 'screenshot plain test',
+      },
+    })
+    const id = spawnResult.content[0].text.match(/ID: (pty_[a-f0-9]+)/)[1]
+    await new Promise((r) => setTimeout(r, 300))
+
+    const shot = await client.request('tools/call', {
+      name: 'pty_screenshot',
+      arguments: { id, format: 'plain' },
+    })
+    const text = shot.content[0].text
+    assert.ok(text.includes('<pty_screenshot>'))
+    assert.ok(text.includes('line1'))
+    assert.ok(text.includes('line2'))
+    assert.ok(text.includes('red'))
+    assert.ok(!text.includes('\x1b['), 'plain screenshot must not contain ESC')
+
+    await client.request('tools/call', { name: 'pty_kill', arguments: { id, cleanup: true } })
+  })
+})
+
+test('pty_screenshot ansi format preserves color codes', async () => {
+  await withClient(async (client) => {
+    const spawnResult = await client.request('tools/call', {
+      name: 'pty_spawn',
+      arguments: {
+        command: 'bash',
+        args: ['-c', 'printf "\\x1b[31mRED\\x1b[0m\\n"; sleep 2'],
+        description: 'screenshot ansi test',
+      },
+    })
+    const id = spawnResult.content[0].text.match(/ID: (pty_[a-f0-9]+)/)[1]
+    await new Promise((r) => setTimeout(r, 300))
+
+    const shot = await client.request('tools/call', {
+      name: 'pty_screenshot',
+      arguments: { id, format: 'ansi' },
+    })
+    const text = shot.content[0].text
+    assert.ok(text.includes('\x1b['), 'ansi screenshot should include ESC codes')
+    assert.ok(text.includes('RED'))
+
+    await client.request('tools/call', { name: 'pty_kill', arguments: { id, cleanup: true } })
   })
 })
 

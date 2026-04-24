@@ -216,6 +216,28 @@ export class RingBuffer {
     return { matches, totalMatches, truncated: truncatedByCap || truncatedByOffset }
   }
 
+  /**
+   * Reconstruct the byte stream this buffer has seen by joining completed
+   * lines with '\n' and appending the in-progress line. Since AnsiLineParser
+   * only splits on `\n` in the normal state, rejoining with `\n` reproduces
+   * the original stream (modulo the post-EOF trailing newline, which terminal
+   * rendering doesn't care about).
+   *
+   * Used by the screenshot tool to feed a headless terminal emulator.
+   */
+  readRawStream(): string {
+    const completeCount = this.lines.length - this.head
+    if (completeCount === 0 && !this.hasCurrent) return ''
+    const parts: string[] = []
+    for (let i = 0; i < completeCount; i++) parts.push(this.lines[this.head + i]!)
+    let joined = parts.join('\n')
+    if (this.hasCurrent) {
+      const tail = this.currentLine.join('')
+      joined = parts.length > 0 ? `${joined}\n${tail}` : tail
+    }
+    return joined
+  }
+
   clear(): void {
     this.lines = []
     this.head = 0

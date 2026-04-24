@@ -4,6 +4,7 @@ import { KEY_NAMES, resolveKey } from '../keys.js'
 import type { PTYManager } from '../pty/manager.js'
 import { compileSafePattern } from '../safe-regex.js'
 import { extractCommands } from '../shell-parse.js'
+import { renderScreenshot } from '../pty/screenshot.js'
 import {
   formatKilled,
   formatReadPayload,
@@ -494,6 +495,102 @@ export function registerTools(
       // Use pre-kill snapshot for wording; status may already have moved.
       const killOutcome: KillOutcome = outcome
       return ok(formatKilled(infoBefore, killOutcome, args.cleanup))
+    }
+  )
+
+  // -------------------- pty_screenshot --------------------
+  server.registerTool(
+    'pty_screenshot',
+    {
+      title: 'Render a terminal screenshot of a PTY session',
+      description: [
+        'Replay the session\'s output through a headless xterm.js emulator and',
+        'return either the plain visible grid (format=\"plain\") or an',
+        'ANSI-preserving serialization (format=\"ansi\").',
+        '',
+        'USE THIS for TUI programs (vim, htop, gdb in layout mode, k9s, btop).',
+        'With pty_read you get a linearized byte log including every cursor',
+        'movement and screen-redraw escape — useless for "what does the user',
+        'see right now?". pty_screenshot gives you the final rendered frame.',
+        '',
+        'Cost: lazy on-demand. A fresh emulator is created per call, the stream',
+        'replayed, then thrown away. Fine for ad-hoc inspection; avoid calling',
+        'in a tight loop.',
+        '',
+        'Size: defaults to the session\'s own cols x rows. Override if you want',
+        'a different viewport (some TUIs reflow on resize).',
+      ].join('\n'),
+      inputSchema: {
+        id: z.string().describe('PTY session ID.'),
+        format: z
+          .enum(['plain', 'ansi'])
+          .default('plain')
+          .describe(
+            'plain: trimmed text grid, one line per row. ansi: bytes with colors + cursor state preserved (via @xterm/addon-serialize).'
+          ),
+        cols: z
+          .number()
+          .int()
+          .positive()
+          .max(500)
+          .optional()
+          .describe('Viewport columns (default: session\'s current cols).'),
+        rows: z
+          .number()
+          .int()
+          .positive()
+          .max(500)
+          .optional()
+          .describe('Viewport rows (default: session\'s current rows).'),
+        includeScrollback: z
+          .boolean()
+          .default(true)
+          .describe('If true, include scrollback above the visible screen.'),
+        scrollback: z
+          .number()
+          .int()
+          .nonnegative()
+          .max(20000)
+          .default(1000)
+          .describe('Scrollback line cap for the headless emulator.'),
+        includeAltBuffer: z
+          .boolean()
+          .default(true)
+          .describe(
+            'ANSI only: include the alternate screen buffer (vim/htop etc. draw here).'
+          ),
+      },
+    },
+    async (args): Promise<ToolResult> => {
+      const session = manager.get(args.id)
+      if (!session) return err(`PTY session '${args.id}' not found.`)
+      const info = session.toInfo()
+      const cols = args.cols ?? info.cols
+      const rows = args.rows ?? info.rows
+      try {
+        const raw = session.buffer.readRawStream()
+        const shot = await renderScreenshot(raw, {
+          format: args.format,
+          cols,
+          rows,
+          scrollback: args.scrollback,
+          includeScrollback: args.includeScrollback,
+          includeAltBuffer: args.includeAltBuffer,
+        })
+        const header = [
+          '<pty_screenshot>',
+          `Session: ${args.id}`,
+          `Format: ${shot.format}`,
+          `Viewport: ${shot.cols}x${shot.rows}`,
+          `Scrollback: ${shot.scrollbackLines} lines`,
+          `Status: ${info.status}`,
+          '---',
+        ].join('\n')
+        const body = shot.text.length > 0 ? shot.text : '(empty terminal)'
+        return ok(`${header}\n${body}\n</pty_screenshot>`)
+      } catch (e) {
+        return err(`pty_screenshot failed: ${e instanceof Error ? e.message : String(e)}`)
+      }
     }
   )
 
