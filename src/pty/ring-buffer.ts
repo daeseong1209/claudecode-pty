@@ -19,6 +19,13 @@ export interface SearchMatch {
   text: string
 }
 
+export type AppendListener = (event: {
+  /** Freshly completed lines this append produced. Absolute line numbers. */
+  completedLines: Array<{ lineNumber: number; text: string }>
+  /** The in-progress line after this append, if any. Absolute line number. */
+  currentLine: { lineNumber: number; text: string } | null
+}) => void
+
 export class RingBuffer {
   private lines: string[] = []
   private head = 0
@@ -30,9 +37,19 @@ export class RingBuffer {
   private linesSeenTotal = 0
   private parser = new AnsiLineParser()
   private readonly capacity: number
+  private listeners: AppendListener[] = []
 
   constructor(capacity = 1_000_000) {
     this.capacity = capacity
+  }
+
+  /** Subscribe to per-append events. Returns an unsubscribe handle. */
+  onAppend(listener: AppendListener): () => void {
+    this.listeners.push(listener)
+    return () => {
+      const idx = this.listeners.indexOf(listener)
+      if (idx !== -1) this.listeners.splice(idx, 1)
+    }
   }
 
   get lineCount(): number {
@@ -63,6 +80,11 @@ export class RingBuffer {
     const lineStarts = this.parser.feed(bytes)
     this.bytesInBuffer += bytes.length
 
+    // Track the new lines we completed this call so we can fire listeners with
+    // their absolute line numbers. We compute the numbers BEFORE
+    // enforceCapacity so listeners see the same numbering the public API uses.
+    const completedThisAppend: Array<{ lineNumber: number; text: string }> = []
+
     let cursor = 0
     for (const start of lineStarts) {
       if (start - 1 > cursor) {
@@ -70,6 +92,11 @@ export class RingBuffer {
         this.currentLine.push(segBytes.toString('utf-8'))
       }
       const completed = this.currentLine.length === 0 ? '' : this.currentLine.join('')
+      // Absolute line number = droppedLines + (index in lines array)
+      completedThisAppend.push({
+        lineNumber: this.droppedLines + (this.lines.length - this.head),
+        text: completed,
+      })
       this.lines.push(completed)
       this.linesSeenTotal += 1
       this.currentLine = []
@@ -85,6 +112,23 @@ export class RingBuffer {
 
     this.enforceCapacity()
     this.compactHead()
+
+    if (this.listeners.length > 0) {
+      const currentLineInfo = this.hasCurrent
+        ? {
+            lineNumber:
+              this.droppedLines + (this.lines.length - this.head),
+            text: this.currentLine.join(''),
+          }
+        : null
+      for (const listener of this.listeners) {
+        try {
+          listener({ completedLines: completedThisAppend, currentLine: currentLineInfo })
+        } catch {
+          // ignore listener errors
+        }
+      }
+    }
   }
 
   readLines(offset: number, count: number): Array<{ lineNumber: number; text: string }> {
@@ -182,6 +226,7 @@ export class RingBuffer {
     this.droppedBytes = 0
     this.linesSeenTotal = 0
     this.parser.reset()
+    this.listeners = []
   }
 
   private enforceCapacity(): void {

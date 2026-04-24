@@ -30,6 +30,38 @@ export interface SessionExitEvent {
 export type ExitCallback = (event: SessionExitEvent) => void
 
 /**
+ * Reason a `waitFor` call resolved.
+ *   - `pattern` — a newly appended line matched the regex
+ *   - `exit`    — the session exited before any of the above fired
+ *   - `idle`    — no new output for the caller-supplied idle window
+ *   - `timeout` — the absolute timeout elapsed first
+ */
+export type WaitReason = 'pattern' | 'exit' | 'idle' | 'timeout'
+
+export interface WaitResult {
+  reason: WaitReason
+  /** If reason === 'pattern', the line that matched. */
+  match?: { lineNumber: number; text: string }
+  /** Final status snapshot at the time of resolution. */
+  status: string
+  /** Exit code if reason === 'exit' (may be null for signal death). */
+  exitCode?: number | null
+  /** Signal name/number if reason === 'exit'. */
+  signal?: number | string
+  /** Milliseconds elapsed since the call started. */
+  elapsedMs: number
+}
+
+export interface WaitOptions {
+  /** Resolve when an appended line matches this regex. */
+  pattern?: RegExp
+  /** Resolve if no new output arrives for this many milliseconds. */
+  idleMs?: number
+  /** Absolute timeout — resolves with `timeout` after this many milliseconds. Required. */
+  timeoutMs: number
+}
+
+/**
  * A single PTY session. Wraps one node-pty IPty, a ring buffer, lifecycle
  * state, and optional timeout.
  *
@@ -259,6 +291,118 @@ export class Session {
 
   onExit(cb: ExitCallback): void {
     this.exitCallbacks.push(cb)
+  }
+
+  /**
+   * Wait for something observable on this session, returning a structured
+   * WaitResult. The promise always resolves (never rejects); callers inspect
+   * `reason` to distinguish pattern-match / exit / idle / timeout.
+   *
+   * Rules:
+   *   - If the session is already exited, resolves immediately with reason='exit'.
+   *   - If pattern is supplied, only lines completed AFTER the call starts
+   *     can trigger it — this matches the "wait for next match" intent.
+   *   - The idle timer is reset every time the buffer appends (complete OR
+   *     in-progress line). If no appends happen for idleMs, resolve.
+   *   - timeoutMs is absolute; whichever of the four resolves first wins.
+   */
+  waitFor(options: WaitOptions): Promise<WaitResult> {
+    const start = Date.now()
+    return new Promise<WaitResult>((resolve) => {
+      let resolved = false
+      let idleHandle: NodeJS.Timeout | undefined
+      let timeoutHandle: NodeJS.Timeout | undefined
+      let unsubscribeAppend: (() => void) | undefined
+      let unsubscribeExit: (() => void) | undefined
+
+      const finish = (result: WaitResult) => {
+        if (resolved) return
+        resolved = true
+        if (idleHandle) clearTimeout(idleHandle)
+        if (timeoutHandle) clearTimeout(timeoutHandle)
+        unsubscribeAppend?.()
+        unsubscribeExit?.()
+        resolve(result)
+      }
+
+      const snapshot = () => ({
+        status: this.internal.status,
+        exitCode: this.internal.exitCode,
+        signal: this.internal.exitSignal,
+        elapsedMs: Date.now() - start,
+      })
+
+      // Session already done — resolve immediately.
+      if (this.exited) {
+        finish({
+          reason: 'exit',
+          ...snapshot(),
+        })
+        return
+      }
+
+      const resetIdleTimer = () => {
+        if (options.idleMs === undefined) return
+        if (idleHandle) clearTimeout(idleHandle)
+        idleHandle = setTimeout(() => {
+          finish({ reason: 'idle', ...snapshot() })
+        }, options.idleMs)
+        idleHandle.unref?.()
+      }
+
+      // Subscribe to buffer appends.
+      unsubscribeAppend = this.buffer.onAppend((event) => {
+        // Reset idle timer on any new bytes.
+        resetIdleTimer()
+        // Pattern matching: scan newly completed lines.
+        if (options.pattern) {
+          for (const line of event.completedLines) {
+            if (options.pattern.test(line.text)) {
+              finish({
+                reason: 'pattern',
+                match: line,
+                ...snapshot(),
+              })
+              return
+            }
+          }
+          // Also check the current in-progress line (for REPL prompts etc.).
+          if (event.currentLine && options.pattern.test(event.currentLine.text)) {
+            finish({
+              reason: 'pattern',
+              match: event.currentLine,
+              ...snapshot(),
+            })
+          }
+        }
+      })
+
+      // Subscribe to exit.
+      const exitCb: ExitCallback = (evt) => {
+        finish({
+          reason: 'exit',
+          status: this.internal.status,
+          exitCode: evt.exitCode,
+          signal: evt.signal,
+          elapsedMs: Date.now() - start,
+        })
+      }
+      this.exitCallbacks.push(exitCb)
+      unsubscribeExit = () => {
+        const idx = this.exitCallbacks.indexOf(exitCb)
+        if (idx !== -1) this.exitCallbacks.splice(idx, 1)
+      }
+
+      // Absolute timeout.
+      timeoutHandle = setTimeout(() => {
+        finish({ reason: 'timeout', ...snapshot() })
+      }, options.timeoutMs)
+      timeoutHandle.unref?.()
+
+      // Seed the idle timer — a session that was silent BEFORE the call also
+      // counts toward idle.
+      resetIdleTimer()
+    })
   }
 
   get status() {

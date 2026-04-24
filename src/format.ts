@@ -14,6 +14,69 @@ export function formatLine(lineNumber: number, text: string, maxLength = MAX_LIN
   return `${numStr}| ${truncated}`
 }
 
+/**
+ * Strip ANSI control sequences from a string:
+ *   - CSI sequences (ESC [ ... final-byte)
+ *   - OSC sequences (ESC ] ... BEL or ESC \)
+ *   - DCS / SOS / PM / APC (ESC P/X/^/_ ... ESC \)
+ *   - Bare single-char escapes (ESC <single byte>)
+ *   - Carriage returns preceding a real line break are preserved by the line
+ *     splitter, so we remove lone `\r` here (it would show up as a weird gap).
+ *
+ * This is a lightweight rewrite — doesn't try to be a full VT parser, but
+ * covers >99% of what shows up in build logs / REPL output.
+ */
+export function stripAnsi(input: string): string {
+  // Fast path: no ESC at all. Still drop all CRs so `\r\n` normalizes to `\n`
+  // and lone `\r` redraw artifacts disappear.
+  if (!input.includes('\x1b')) {
+    return input.replace(/\r/g, '')
+  }
+  let out = ''
+  for (let i = 0; i < input.length; i++) {
+    const c = input.charCodeAt(i)
+    if (c === 0x1b) {
+      // ESC — figure out what kind.
+      const next = input.charCodeAt(i + 1)
+      if (next === 0x5b /* [ */) {
+        // CSI — consume until final byte in 0x40..0x7E
+        i += 2
+        while (i < input.length) {
+          const b = input.charCodeAt(i)
+          if (b >= 0x40 && b <= 0x7e) break
+          i++
+        }
+        continue
+      }
+      if (next === 0x5d /* ] */ || next === 0x50 /* P */ || next === 0x58 /* X */ || next === 0x5e /* ^ */ || next === 0x5f /* _ */) {
+        // OSC/DCS/SOS/PM/APC — consume until BEL or ESC \
+        i += 2
+        while (i < input.length) {
+          const b = input.charCodeAt(i)
+          if (b === 0x07) break // BEL
+          if (b === 0x1b && input.charCodeAt(i + 1) === 0x5c) {
+            i += 1 // will advance past backslash via outer loop
+            break
+          }
+          i++
+        }
+        continue
+      }
+      // Any other 2-byte escape — skip the ESC + next byte.
+      i += 1
+      continue
+    }
+    if (c === 0x0d /* \r */) {
+      // Drop lone CRs that aren't followed by LF (terminal redraw artifacts).
+      if (input.charCodeAt(i + 1) !== 0x0a) continue
+      // Preserve `\r\n` sequences by letting \n through next iteration.
+      continue
+    }
+    out += input[i]
+  }
+  return out
+}
+
 export function formatSessionList(sessions: PTYSessionInfo[]): string {
   if (sessions.length === 0) return '<pty_list>\n(no active PTY sessions)\n</pty_list>'
   const body: string[] = ['<pty_list>']
@@ -100,6 +163,7 @@ export function formatReadPayload(
     pattern?: string
     matchCount?: number
     searchTruncated?: boolean
+    stripAnsi?: boolean
   }
 ): string {
   const attrs = [`id="${s.id}"`, `status="${s.status}"`, `mode="${meta.mode}"`]
@@ -121,7 +185,8 @@ export function formatReadPayload(
     }
   } else {
     for (const { lineNumber, text } of lines) {
-      body.push(formatLine(lineNumber, text))
+      const rendered = meta.stripAnsi ? stripAnsi(text) : text
+      body.push(formatLine(lineNumber, rendered))
     }
   }
 

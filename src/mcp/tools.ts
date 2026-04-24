@@ -114,21 +114,36 @@ export function registerTools(
   server.registerTool(
     'pty_write',
     {
-      title: 'Write raw text to a PTY',
+      title: 'Write text to a PTY (optionally submitting it)',
       description: [
-        'Write raw text to a running PTY session. Useful for typing commands, pasting content,',
-        'or responding to prompts. Text is sent as-is; no escape expansion.',
+        'Write text to a running PTY. Useful for typing commands, pasting content,',
+        'or responding to prompts.',
         '',
-        'To send Enter/Ctrl+C/arrow keys, use pty_send_key instead — named keys are safer.',
+        'Set `submit: true` to append "\\n" automatically — the common "type a command',
+        'and hit Enter" pattern. This replaces the older `pty_write + pty_send_key Enter`',
+        "two-call dance with a single call. Default is false so you can still paste",
+        "partial text without submitting.",
         '',
-        'Best-effort permission check: commands detected in the text are matched against the',
-        'deny/allow config. The parser understands quoting, pipes, redirects, env-prefixes and',
-        'recurses into $(...) / `...` substitutions, but it is NOT a full shell. For hard',
-        'guarantees, deny shell entry-points (bash/sh/zsh/pwsh) at pty_spawn time.',
+        'To send Ctrl+C / arrow keys / function keys use `pty_send_key` — named keys',
+        'are safer than guessing escape sequences.',
+        '',
+        'Best-effort permission check: the parser understands quoting, pipes, redirects,',
+        'env-prefixes, `$()` / backticks / `<()` / `>()` substitution, subshells, brace',
+        'groups, bash keywords (`if`/`for`/`case`/...), and command wrappers (`exec`/`env`/',
+        '`nice`/...). It is NOT a full shell. For hard guarantees, deny shell entry-points',
+        '(`bash`/`sh`/`zsh`/`pwsh`) at `pty_spawn` time.',
       ].join('\n'),
       inputSchema: {
         id: z.string().describe('PTY session ID (e.g. pty_a1b2c3d4).'),
-        text: z.string().describe('Text to send. Include a trailing "\\n" if you want to submit a command line.'),
+        text: z
+          .string()
+          .describe('Text to send. Characters are sent as-is; no escape expansion.'),
+        submit: z
+          .boolean()
+          .default(false)
+          .describe(
+            'If true, append a trailing "\\n" so the command is submitted. Default false (raw paste).'
+          ),
       },
     },
     async (args): Promise<ToolResult> => {
@@ -137,17 +152,20 @@ export function registerTools(
       if (session.status !== 'running') {
         return err(`Cannot write to PTY '${args.id}': status is '${session.status}'.`)
       }
-      for (const cmd of extractCommands(args.text)) {
+      const payload = args.submit ? `${args.text}\n` : args.text
+      for (const cmd of extractCommands(payload)) {
         const perm = checkPermission(config, cmd.command, cmd.args)
         if (perm.action === 'deny') {
           return err(`pty_write denied (best-effort): ${perm.reason}`)
         }
       }
-      const success = session.write(args.text)
+      const success = session.write(payload)
       if (!success) return err(`Failed to write to PTY '${args.id}'.`)
-      const preview = args.text.length > 80 ? `${args.text.slice(0, 80)}…` : args.text
+      const preview = payload.length > 80 ? `${payload.slice(0, 80)}…` : payload
       const display = preview.replace(/[\x00-\x1f]/g, (c) => `\\x${c.charCodeAt(0).toString(16).padStart(2, '0')}`)
-      return ok(`Sent ${args.text.length} bytes to ${args.id}: "${display}"`)
+      return ok(
+        `Sent ${payload.length} bytes to ${args.id}${args.submit ? ' (with trailing newline)' : ''}: "${display}"`
+      )
     }
   )
 
@@ -224,6 +242,12 @@ export function registerTools(
           .optional()
           .describe('Regex pattern. When set, only matching lines are returned, then offset/limit apply.'),
         ignoreCase: z.boolean().default(false).describe('Case-insensitive pattern matching.'),
+        stripAnsi: z
+          .boolean()
+          .default(false)
+          .describe(
+            'If true, strip ANSI escape sequences (colors, cursor moves, bracketed-paste markers) from returned lines. Use this when you just want the plain text. The raw bytes remain in the buffer.'
+          ),
       },
     },
     async (args): Promise<ToolResult> => {
@@ -254,6 +278,7 @@ export function registerTools(
             pattern: args.pattern,
             matchCount: result.totalMatches,
             searchTruncated: result.truncated,
+            stripAnsi: args.stripAnsi,
           })
         )
       }
@@ -267,6 +292,7 @@ export function registerTools(
             limit: args.tail,
             totalLines: info.lineCount,
             hasMore: false,
+            stripAnsi: args.stripAnsi,
           })
         )
       }
@@ -280,8 +306,137 @@ export function registerTools(
           limit: args.limit,
           totalLines: info.lineCount,
           hasMore,
+          stripAnsi: args.stripAnsi,
         })
       )
+    }
+  )
+
+  // -------------------- pty_wait --------------------
+  server.registerTool(
+    'pty_wait',
+    {
+      title: 'Block until a PTY event happens',
+      description: [
+        'Efficiently wait for an event on a PTY session instead of polling with pty_read.',
+        '',
+        'Specify one or more of: `pattern` (regex that should appear in a newly appended',
+        "line), `untilExit` (true → resolve when the process exits), `idleMs` (resolve",
+        "when no new output arrives for this many milliseconds). Whichever fires first",
+        "wins. `timeoutSeconds` is required and bounds the maximum wait.",
+        '',
+        'Returns a structured report:',
+        '  - reason=pattern  → the matching line (absolute line number + text)',
+        '  - reason=exit     → exit code and signal',
+        '  - reason=idle     → quiet period elapsed',
+        '  - reason=timeout  → absolute timeout elapsed first (NOT an error)',
+        '',
+        'Agent token savings: one pty_wait call replaces dozens of pty_read polling',
+        'rounds when waiting for a build/test/prompt.',
+      ].join('\n'),
+      inputSchema: {
+        id: z.string().describe('PTY session ID.'),
+        pattern: z
+          .string()
+          .optional()
+          .describe(
+            'Regex pattern; when a newly appended line matches, resolve with reason="pattern".'
+          ),
+        ignoreCase: z
+          .boolean()
+          .default(false)
+          .describe('Case-insensitive pattern matching.'),
+        untilExit: z
+          .boolean()
+          .default(false)
+          .describe(
+            'If true, also resolve when the process exits with reason="exit". Already-exited sessions resolve immediately.'
+          ),
+        idleMs: z
+          .number()
+          .int()
+          .positive()
+          .max(600_000)
+          .optional()
+          .describe(
+            'If set, resolve with reason="idle" when no new output has arrived for this many ms (useful for REPL prompt detection).'
+          ),
+        timeoutSeconds: z
+          .number()
+          .int()
+          .positive()
+          .max(3600)
+          .default(60)
+          .describe(
+            'Hard upper bound on the wait. Default 60s, max 3600s. Timeout is reported as reason="timeout", not an error.'
+          ),
+      },
+    },
+    async (args): Promise<ToolResult> => {
+      const session = manager.get(args.id)
+      if (!session) return err(`PTY session '${args.id}' not found.`)
+
+      let regex: RegExp | undefined
+      if (args.pattern) {
+        try {
+          const compiled = compileSafePattern(args.pattern, args.ignoreCase)
+          regex = compiled.regex
+        } catch (e) {
+          return err(`pty_wait: ${e instanceof Error ? e.message : String(e)}`)
+        }
+      }
+
+      if (!regex && !args.untilExit && args.idleMs === undefined) {
+        return err(
+          'pty_wait: must specify at least one of `pattern`, `untilExit=true`, or `idleMs`.'
+        )
+      }
+
+      const timeoutMs = args.timeoutSeconds * 1000
+
+      // If untilExit is false and the session is already exited, there's no
+      // point in waiting for pattern/idle — return immediately with exit info.
+      if (!args.untilExit && session.status !== 'running') {
+        const info = session.toInfo()
+        return ok(
+          [
+            '<pty_wait>',
+            `Session: ${args.id}`,
+            `Reason: exit (session was already ${info.status} before wait started)`,
+            `Status: ${info.status}`,
+            `Exit Code: ${info.exitCode ?? 'null (signal-killed)'}`,
+            `Signal: ${info.exitSignal ?? 'none'}`,
+            `Elapsed: 0ms`,
+            '</pty_wait>',
+          ].join('\n')
+        )
+      }
+
+      const result = await session.waitFor({
+        pattern: regex,
+        idleMs: args.idleMs,
+        timeoutMs,
+      })
+
+      // If the caller didn't ask for untilExit but the process exited anyway,
+      // we still report it — they probably want to know.
+      const lines = [
+        '<pty_wait>',
+        `Session: ${args.id}`,
+        `Reason: ${result.reason}`,
+        `Status: ${result.status}`,
+      ]
+      if (result.reason === 'pattern' && result.match) {
+        lines.push(`Match line: ${result.match.lineNumber + 1}`)
+        lines.push(`Match text: ${result.match.text.length > 300 ? result.match.text.slice(0, 300) + '…' : result.match.text}`)
+      }
+      if (result.reason === 'exit') {
+        lines.push(`Exit Code: ${result.exitCode ?? 'null (signal-killed)'}`)
+        lines.push(`Signal: ${result.signal ?? 'none'}`)
+      }
+      lines.push(`Elapsed: ${result.elapsedMs}ms`)
+      lines.push('</pty_wait>')
+      return ok(lines.join('\n'))
     }
   )
 

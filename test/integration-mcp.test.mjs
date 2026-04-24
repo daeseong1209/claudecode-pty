@@ -107,7 +107,7 @@ async function withClient(fn) {
   }
 }
 
-test('lists 7 pty tools', async () => {
+test('lists 8 pty tools', async () => {
   await withClient(async (client) => {
     const result = await client.request('tools/list', {})
     const names = result.tools.map((t) => t.name).sort()
@@ -118,8 +118,161 @@ test('lists 7 pty tools', async () => {
       'pty_resize',
       'pty_send_key',
       'pty_spawn',
+      'pty_wait',
       'pty_write',
     ])
+  })
+})
+
+test('pty_write submit=true appends newline and submits command', async () => {
+  await withClient(async (client) => {
+    const spawnResult = await client.request('tools/call', {
+      name: 'pty_spawn',
+      arguments: {
+        command: 'bash',
+        args: ['-c', 'read LINE; echo "got: $LINE"'],
+        description: 'pty_write submit test',
+      },
+    })
+    const id = spawnResult.content[0].text.match(/ID: (pty_[a-f0-9]+)/)[1]
+    await new Promise((r) => setTimeout(r, 200))
+
+    // Single call — no separate pty_send_key Enter needed.
+    await client.request('tools/call', {
+      name: 'pty_write',
+      arguments: { id, text: 'hello-submit', submit: true },
+    })
+
+    await new Promise((r) => setTimeout(r, 400))
+
+    const readResult = await client.request('tools/call', {
+      name: 'pty_read',
+      arguments: { id, tail: 20 },
+    })
+    assert.ok(
+      readResult.content[0].text.includes('got: hello-submit'),
+      `expected echoed input, got:\n${readResult.content[0].text}`
+    )
+
+    await client.request('tools/call', {
+      name: 'pty_kill',
+      arguments: { id, cleanup: true },
+    })
+  })
+})
+
+test('pty_read stripAnsi=true removes color codes from output', async () => {
+  await withClient(async (client) => {
+    const spawnResult = await client.request('tools/call', {
+      name: 'pty_spawn',
+      arguments: {
+        command: 'bash',
+        args: ['-c', 'printf "\\x1b[31mRED\\x1b[0m\\n\\x1b[32mGREEN\\x1b[0m\\n"'],
+        description: 'stripAnsi test',
+      },
+    })
+    const id = spawnResult.content[0].text.match(/ID: (pty_[a-f0-9]+)/)[1]
+    await new Promise((r) => setTimeout(r, 300))
+
+    const rawRead = await client.request('tools/call', {
+      name: 'pty_read',
+      arguments: { id, tail: 10, stripAnsi: false },
+    })
+    assert.ok(rawRead.content[0].text.includes('\x1b['), 'raw read should include ESC')
+
+    const cleanRead = await client.request('tools/call', {
+      name: 'pty_read',
+      arguments: { id, tail: 10, stripAnsi: true },
+    })
+    assert.ok(!cleanRead.content[0].text.includes('\x1b['), 'stripped read must not include ESC')
+    assert.ok(cleanRead.content[0].text.includes('RED'))
+    assert.ok(cleanRead.content[0].text.includes('GREEN'))
+
+    await client.request('tools/call', {
+      name: 'pty_kill',
+      arguments: { id, cleanup: true },
+    })
+  })
+})
+
+test('pty_wait resolves on pattern match', async () => {
+  await withClient(async (client) => {
+    const spawnResult = await client.request('tools/call', {
+      name: 'pty_spawn',
+      arguments: {
+        command: 'bash',
+        args: ['-c', 'sleep 0.3; echo "READY marker"; sleep 10'],
+        description: 'pty_wait pattern test',
+      },
+    })
+    const id = spawnResult.content[0].text.match(/ID: (pty_[a-f0-9]+)/)[1]
+
+    const waitResult = await client.request('tools/call', {
+      name: 'pty_wait',
+      arguments: { id, pattern: 'READY', timeoutSeconds: 5 },
+    })
+    const text = waitResult.content[0].text
+    assert.ok(text.includes('Reason: pattern'), `expected pattern match, got:\n${text}`)
+    assert.ok(text.includes('READY marker'))
+
+    await client.request('tools/call', {
+      name: 'pty_kill',
+      arguments: { id, cleanup: true },
+    })
+  })
+})
+
+test('pty_wait untilExit=true resolves when process exits', async () => {
+  await withClient(async (client) => {
+    const spawnResult = await client.request('tools/call', {
+      name: 'pty_spawn',
+      arguments: {
+        command: 'bash',
+        args: ['-c', 'echo hi; sleep 0.3; exit 0'],
+        description: 'pty_wait exit test',
+      },
+    })
+    const id = spawnResult.content[0].text.match(/ID: (pty_[a-f0-9]+)/)[1]
+
+    const waitResult = await client.request('tools/call', {
+      name: 'pty_wait',
+      arguments: { id, untilExit: true, timeoutSeconds: 5 },
+    })
+    const text = waitResult.content[0].text
+    assert.ok(text.includes('Reason: exit'), `expected exit, got:\n${text}`)
+    assert.ok(text.includes('Exit Code: 0'))
+
+    await client.request('tools/call', {
+      name: 'pty_kill',
+      arguments: { id, cleanup: true },
+    })
+  })
+})
+
+test('pty_wait timeoutSeconds returns timeout (not error) when nothing fires', async () => {
+  await withClient(async (client) => {
+    const spawnResult = await client.request('tools/call', {
+      name: 'pty_spawn',
+      arguments: {
+        command: 'bash',
+        args: ['-c', 'sleep 30'],
+        description: 'pty_wait timeout test',
+      },
+    })
+    const id = spawnResult.content[0].text.match(/ID: (pty_[a-f0-9]+)/)[1]
+
+    const waitResult = await client.request('tools/call', {
+      name: 'pty_wait',
+      arguments: { id, pattern: 'never-fires', timeoutSeconds: 1 },
+    })
+    const text = waitResult.content[0].text
+    assert.ok(!waitResult.isError, 'timeout should not be isError')
+    assert.ok(text.includes('Reason: timeout'), `expected timeout, got:\n${text}`)
+
+    await client.request('tools/call', {
+      name: 'pty_kill',
+      arguments: { id, cleanup: true },
+    })
   })
 })
 

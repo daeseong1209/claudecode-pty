@@ -1,6 +1,6 @@
 {
   "name": "claudecode-pty",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "description": "Production-grade MCP server for interactive PTY session management in Claude Code. Spawn background processes, send input, stream and grep output, all through seven focused tools.",
   "type": "module",
   "main": "dist/index.js",
